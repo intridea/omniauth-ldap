@@ -24,6 +24,8 @@ module OmniAuth
       option :method, :plain
       option :uid, 'sAMAccountName'
       option :name_proc, lambda {|n| n}
+      option :group_query, nil
+      option :group_attribute, 'cn'
 
       def request_phase
         OmniAuth::LDAP::Adaptor.validate @options
@@ -42,11 +44,30 @@ module OmniAuth
           @ldap_user_info = @adaptor.bind_as(:filter => filter(@adaptor), :size => 1, :password => request['password'])
           return fail!(:invalid_credentials) if !@ldap_user_info
 
+          # I [aocole] believe there is a bug in the Net::LDAP library that
+          # improperly encodes utf_8 as ASCII-8BIT when it receives unicode
+          # from the LDAP server. Fix it up here because I don't have time
+          # to track it down in Net::LDAP
+          fix_encoding!(@ldap_user_info)
+
+          # execute groups query
+          @groups = group_query(@adaptor, @ldap_user_info)
+          
           @user_info = self.class.map_user(@@config, @ldap_user_info)
           super
         rescue Exception => e
           return fail!(:ldap_error, e)
         end
+      end
+
+      def group_query adaptor, ldap_user_info
+        return nil unless adaptor.group_query and !adaptor.group_query.empty?
+
+        uid = ldap_user_info[@options[:uid].intern].first
+        dn = ldap_user_info[:dn].first
+        groups = adaptor.search(filter: adaptor.group_query % {username: Net::LDAP::Filter.escape(uid), dn: Net::LDAP::Filter.escape(dn)})
+        groups.collect!{|g|g[options[:group_attribute].intern].first}
+        return groups
       end
 
       def filter adaptor
@@ -64,7 +85,9 @@ module OmniAuth
         @user_info
       }
       extra {
-        { :raw_info => @ldap_user_info }
+        ex = { :raw_info => @ldap_user_info }
+        ex[:groups] = @groups if @groups
+        ex
       }
 
       def self.map_user(mapper, object)
@@ -94,6 +117,42 @@ module OmniAuth
       def missing_credentials?
         request['username'].nil? or request['username'].empty? or request['password'].nil? or request['password'].empty?
       end # missing_credentials?
+
+
+      # This is written a little strangely because we can't modify the object in-place due
+      # to frozen strings used in rspec stubs. Thus, the Hash and Array cases re-assign their
+      # contents, while the String case returns a new String.
+      def fix_encoding!(thing)
+        case thing
+        when Net::LDAP::Entry
+          thing.each_attribute do |k|
+            fix_encoding!(thing[k])
+          end
+        when Hash
+          thing.each_pair do |k, v|
+            thing[k] = fix_encoding!(v)
+          end
+        when Array
+          thing.collect! do |v|
+            fix_encoding!(v)
+          end
+        when String
+          sanitize_utf8(thing)
+        end
+      end
+
+      def sanitize_utf8(str)
+        str = str.dup
+        if str.force_encoding(Encoding::UTF_8).valid_encoding?
+          return str # has been forced to utf-8
+        end
+
+        return str.encode(Encoding::UTF_8, "binary",
+                           :invalid => :replace,
+                           :undef   => :replace,
+                           :replace => "")
+      end
+
     end
   end
 end
